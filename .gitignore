@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+*.env
+
+# Claude Code local settings
+.claude/
+
+# Data files (large, re-downloadable)
+data/
+!data/.gitkeep
+
+# Output (re-generatable)
+output/
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
