@@ -26,6 +26,27 @@ import matplotlib.dates as mdates
 ANNUAL_FEE = 0.0111
 DAILY_FEE  = ANNUAL_FEE / 250
 
+# ── Transaction cost parameters ──
+# Based on NYMEX NG contract specs:
+#   Contract size: 10,000 MMBtu
+#   Min tick: $0.001/MMBtu = $10/tick
+#   Front-month bid-ask spread: ~1 tick ($0.001)
+#   2nd-month bid-ask spread:   ~2 ticks ($0.002)
+#   CME exchange fee: ~$1.50/side
+#   Broker commission: ~$0.50/side (institutional)
+# At $3.50/MMBtu, contract value = $35,000
+#
+# Per roll: sell M1 (half-spread) + buy M2 (half-spread)
+#   = 0.0143% + 0.0286% + exchange + broker
+#   = ~0.054% per roll = ~5.4 bps
+#   Annualized: ~0.65%/year (12 rolls)
+ROLL_TRANSACTION_COST = 0.00054   # 5.4 bps per roll event
+DAILY_REBAL_COST      = 0.000005  # ~0.5 bp daily trading friction
+
+# UNG-specific market impact (large fund ~$500M AUM)
+# sqrt(0.89% participation) * spread ~ 2.7 bps additional
+UNG_MARKET_IMPACT     = 0.00027   # per roll, added on top for UNG-style sim
+
 MONTH_MAP = {
     'F': 1,  'G': 2,  'H': 3,  'J': 4,  'K': 5,  'M': 6,
     'N': 7,  'Q': 8,  'U': 9,  'V': 10, 'X': 11, 'Z': 12
@@ -264,19 +285,24 @@ def calculate_roll_costs(schedule):
     return roll_df
 
 
-def simulate_strategy_nav(schedule, month_label='M1', strategy_name='M1'):
+def simulate_strategy_nav(schedule, month_label='M1', strategy_name='M1',
+                          include_txcost=True):
     """
     Simulate NAV by holding the Nth-month contract daily.
+    Uses CLOSE-to-CLOSE returns (same as ETF NAV calculation).
 
-    On same-contract days: return = close_today / close_yesterday - 1
-    On roll days: return = 0 (NAV carries forward).
+    Price convention:
+      - All returns are computed from close_yesterday to close_today.
+      - This matches how ETF NAVs are marked: using end-of-day settlement.
+
+    On same-contract days:
+      return = close_today / close_yesterday - 1 - daily_fee
+    On roll days:
+      return = 0 (NAV carries forward, minus fee and transaction cost).
       Why? When you roll, you sell X units of old contract and buy Y units
       of new contract at market prices. Your TOTAL VALUE doesn't change.
       The roll cost is already reflected in the new contract's subsequent
       returns (it starts from a different price level).
-
-    The cumulative NAV difference vs spot IS the tracking error, which
-    includes roll yield implicitly through the new contract's price path.
     """
     close_col = f'{month_label}_close'
     cid_col = f'{month_label}_cid'
@@ -292,17 +318,21 @@ def simulate_strategy_nav(schedule, month_label='M1', strategy_name='M1'):
 
     for i in range(1, n):
         if np.isnan(closes[i]) or np.isnan(closes[i-1]) or closes[i-1] == 0:
-            # Missing price: hold flat
             nav[i] = nav[i-1]
             n_missing += 1
         elif cids[i] != cids[i-1]:
-            # Roll day: hold flat (no cross-contract return)
-            # Deduct fee only
-            nav[i] = nav[i-1] * (1 - DAILY_FEE)
+            # Roll day: hold flat, deduct fee + transaction cost
+            cost = DAILY_FEE
+            if include_txcost:
+                cost += ROLL_TRANSACTION_COST
+            nav[i] = nav[i-1] * (1 - cost)
             n_roll_skip += 1
         else:
-            # Same contract: normal return
-            ret = closes[i] / closes[i-1] - 1 - DAILY_FEE
+            # Same contract: close-to-close return
+            daily_cost = DAILY_FEE
+            if include_txcost:
+                daily_cost += DAILY_REBAL_COST
+            ret = closes[i] / closes[i-1] - 1 - daily_cost
             nav[i] = nav[i-1] * (1 + ret)
 
     if n_missing > 0:
@@ -310,6 +340,152 @@ def simulate_strategy_nav(schedule, month_label='M1', strategy_name='M1'):
               f'{n_roll_skip} roll-day skips')
 
     return pd.Series(nav, index=schedule['date'], name=strategy_name)
+
+
+def simulate_ung_prospectus_nav(schedule, cal, include_txcost=True):
+    """
+    Simulate UNG-style NAV using the SEC prospectus rolling rule.
+
+    UNG Roll Mechanics (from SEC prospectus / USCF documentation):
+    ──────────────────────────────────────────────────────────────
+    "During the four business days from two weeks (= 10 business days)
+    before the near month natural gas futures contract expires, the fund
+    rolls its position into the next-month contract. Approximately 25%
+    of the position is traded on each of these four days."
+
+    Weight schedule (START-of-day weights used for today's return):
+      bd_remain >= 10:  (1.0, 0.0)   normal holding of near-month
+      bd_remain == 9:   (0.75, 0.25) first 25% already rolled at prev close
+      bd_remain == 8:   (0.50, 0.50)
+      bd_remain == 7:   (0.25, 0.75)
+      bd_remain <= 6:   (0.0, 1.0)   fully in next-month
+
+    The 4 rebalance trades happen at the close of days with
+    bd_remain = 10, 9, 8, 7. The weight change is observed on the
+    NEXT day (bd_remain = 9, 8, 7, 6 respectively).
+
+    Return calculation:
+      - On normal days (no contract transition):
+          r = w_m1 * r_m1_same_contract + w_m2 * r_m2_same_contract
+      - On schedule contract-transition days (M1_cid changes because
+        old M1 expired):
+          The contract we held (yesterday's schedule M2) is now today's
+          schedule M1. Return is computed as:
+            r = schedule.M1_close[i] / schedule.M2_close[i-1] - 1
+
+    Transaction costs (only if include_txcost=True):
+      - DAILY_FEE applied every day (management fee)
+      - DAILY_REBAL_COST applied every day (daily trading friction)
+      - On roll days (weight changed from yesterday), apply:
+          w_diff * (ROLL_TRANSACTION_COST + UNG_MARKET_IMPACT)
+        where w_diff = |w_m1[i] - w_m1[i-1]| (= 0.25 on each of 4 roll days)
+    """
+    # ── Step 0: Build expiry lookup (instrument_id -> expiry as datetime64[D]) ──
+    cal_expiry = {}
+    for _, row in cal.iterrows():
+        cid = row['instrument_id']
+        expiry_ts = pd.Timestamp(row['expiry'])
+        if pd.isna(expiry_ts):
+            continue
+        cal_expiry[cid] = np.datetime64(expiry_ts.date(), 'D')
+
+    dates_np = pd.to_datetime(schedule['date'].values).to_numpy().astype('datetime64[D]')
+    m1_close = schedule['M1_close'].values.astype(float)
+    m2_close = schedule['M2_close'].values.astype(float)
+    m1_cid   = schedule['M1_cid'].values
+    n = len(dates_np)
+
+    # ── Step 1: Compute bd_remain and start-of-day weights for each day ──
+    # bd_remain = business days from today (inclusive) to expiry (exclusive)
+    bd_remain = np.full(n, 999, dtype=int)
+    w_m1 = np.ones(n)
+    w_m2 = np.zeros(n)
+
+    for i in range(n):
+        cid = m1_cid[i]
+        if cid is None or (isinstance(cid, float) and np.isnan(cid)):
+            continue
+        if cid not in cal_expiry:
+            continue
+        expiry_np = cal_expiry[cid]
+        bd = int(np.busday_count(dates_np[i], expiry_np))
+        bd_remain[i] = bd
+
+        if bd >= 10:
+            w_m1[i], w_m2[i] = 1.0, 0.0
+        elif bd == 9:
+            w_m1[i], w_m2[i] = 0.75, 0.25
+        elif bd == 8:
+            w_m1[i], w_m2[i] = 0.50, 0.50
+        elif bd == 7:
+            w_m1[i], w_m2[i] = 0.25, 0.75
+        else:  # bd <= 6
+            w_m1[i], w_m2[i] = 0.0, 1.0
+
+    # ── Step 2: Simulate NAV ──
+    nav = np.full(n, np.nan)
+    nav[0] = 100.0
+
+    n_expiry_transitions = 0
+    n_roll_trade_days    = 0
+    n_incomplete_roll    = 0
+
+    for i in range(1, n):
+        contract_transition = (m1_cid[i] != m1_cid[i-1])
+
+        if contract_transition:
+            # Old near-month expired. The contract we held (yesterday's M2)
+            # is now today's M1. Compute its return across the transition.
+            if (not np.isnan(m1_close[i]) and not np.isnan(m2_close[i-1])
+                    and m2_close[i-1] != 0):
+                r = m1_close[i] / m2_close[i-1] - 1
+            else:
+                r = 0.0
+
+            if w_m1[i-1] > 0.001:
+                n_incomplete_roll += 1
+
+            cost = DAILY_FEE
+            if include_txcost:
+                cost += DAILY_REBAL_COST
+            nav[i] = nav[i-1] * (1 + r - cost)
+            n_expiry_transitions += 1
+
+        else:
+            # Same contracts as yesterday — compute blended return
+            if (not np.isnan(m1_close[i]) and not np.isnan(m1_close[i-1])
+                    and m1_close[i-1] != 0):
+                r_m1 = m1_close[i] / m1_close[i-1] - 1
+            else:
+                r_m1 = 0.0
+
+            if (not np.isnan(m2_close[i]) and not np.isnan(m2_close[i-1])
+                    and m2_close[i-1] != 0):
+                r_m2 = m2_close[i] / m2_close[i-1] - 1
+            else:
+                r_m2 = r_m1
+
+            r = w_m1[i] * r_m1 + w_m2[i] * r_m2
+
+            # Cost: if weights changed from yesterday, a trade occurred at prev close
+            w_diff = abs(w_m1[i] - w_m1[i-1])
+            cost = DAILY_FEE
+            if include_txcost:
+                cost += DAILY_REBAL_COST
+                if w_diff > 0.001:
+                    cost += w_diff * (ROLL_TRANSACTION_COST + UNG_MARKET_IMPACT)
+                    n_roll_trade_days += 1
+
+            nav[i] = nav[i-1] * (1 + r - cost)
+
+    print(f'    UNG (prospectus rule):')
+    print(f'      {n_expiry_transitions} contract-expiry transitions')
+    print(f'      {n_roll_trade_days} roll-trade days '
+          f'(expect ~4 per expiry = {4 * n_expiry_transitions})')
+    if n_incomplete_roll > 0:
+        print(f'      WARNING: {n_incomplete_roll} expiries with incomplete roll')
+
+    return pd.Series(nav, index=schedule['date'], name='UNG_sim')
 
 
 def run():
@@ -335,11 +511,14 @@ def run():
 
     # ── Simulate NAVs ──
     print('\n  Simulating strategy NAVs...')
+    print('  (all using close-to-close returns, with transaction costs)')
     m1_nav = simulate_strategy_nav(schedule, 'M1', 'M1')
     m3_nav = simulate_strategy_nav(schedule, 'M3', 'M3')
     m6_nav = simulate_strategy_nav(schedule, 'M6', 'M6')
+    ung_sim = simulate_ung_prospectus_nav(schedule, cal)
 
-    for name, s in [('M1', m1_nav), ('M3', m3_nav), ('M6', m6_nav)]:
+    for name, s in [('M1', m1_nav), ('M3', m3_nav), ('M6', m6_nav),
+                     ('UNG_sim', ung_sim)]:
         total = s.iloc[-1] / s.iloc[0] - 1
         print(f'    {name}: end={s.iloc[-1]:.2f}, total={total:+.2%}')
 
@@ -355,7 +534,8 @@ def run():
     ung_nav = ung / ung.iloc[0] * 100
 
     nav_all = pd.DataFrame({
-        'Spot': spot_nav, 'M1': m1_nav, 'M3': m3_nav, 'M6': m6_nav, 'UNG': ung_nav,
+        'Spot': spot_nav, 'M1': m1_nav, 'M3': m3_nav, 'M6': m6_nav,
+        'UNG_sim': ung_sim, 'UNG': ung_nav,
     }).dropna()
 
     nav_all.to_csv(os.path.join(DATA_DIR, 'nav_strategies.csv'))
@@ -385,12 +565,13 @@ def run():
     print(f'  Mean |diff|: ${(common["M1"]-common["NGF"]).abs().mean():.3f}')
 
     # ── Plot 1: NAV comparison ──
-    colors = {'Spot':'#E91E63','M1':'#4CAF50','M3':'#2196F3','M6':'#9C27B0','UNG':'#FF9800'}
-    labels = {'Spot':'Henry Hub Spot','M1':'M1 (front-month)','M3':'M3 (3rd-month)',
-              'M6':'M6 (6th-month)','UNG':'UNG ETF (actual)'}
+    colors = {'Spot':'#E91E63','M1':'#4CAF50','M3':'#2196F3','M6':'#9C27B0',
+              'UNG_sim':'#FFEB3B','UNG':'#FF9800'}
+    labels = {'Spot':'Henry Hub Spot','M1':'M1 (1-day roll)','M3':'M3 (3rd-month)',
+              'M6':'M6 (6th-month)','UNG_sim':'UNG sim (4-day roll)','UNG':'UNG ETF (actual)'}
 
     fig, ax = plt.subplots(figsize=(14, 8))
-    for col in ['Spot','M1','M3','M6','UNG']:
+    for col in ['Spot','M1','M3','M6','UNG_sim','UNG']:
         ax.plot(nav_all.index, nav_all[col], color=colors[col],
                 linewidth=2 if col=='Spot' else 1.3, label=labels[col])
     ax.set_yscale('log')
